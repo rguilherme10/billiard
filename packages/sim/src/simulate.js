@@ -3,9 +3,11 @@
 // every 1/360 s, guards every 6 steps with dt = 1/60). Pure function of its
 // inputs: no clock, no randomness, inputs are never mutated.
 import { BALL, SHOT, TUNING, getTableProfile } from './constants.js';
-import { createWorld } from './world.js';
+import { addBody, createWorld } from './world.js';
 import { applyCueImpulse, createBall } from './ball.js';
 import { createGuards } from './guards.js';
+import { createEventLog, createEventRecorder } from './events.js';
+import { createFrameSampler, quatOf } from './frames.js';
 
 /** @import * as CANNON from 'cannon-es' */
 /** @import { SimBall } from './ball.js' */
@@ -15,6 +17,7 @@ const STEP = 1 / 360;
 const STEPS_PER_SECOND = 360;
 const GUARD_EVERY = 6;
 const GUARD_DT = 1 / 60;
+const SAMPLE_EVERY = 12;
 
 /**
  * @param {TableState} table
@@ -23,7 +26,7 @@ const GUARD_DT = 1 / 60;
  * @returns {ShotResult}
  */
 export function simulateShot(table, shot, opts = {}) {
-  const { tuning = TUNING, maxSimSeconds = 20 } = opts;
+  const { tuning = TUNING, maxSimSeconds = 20, probe = false } = opts;
   validateShot(shot);
   if (!(Number.isFinite(maxSimSeconds) && maxSimSeconds > 0)) {
     throw new RangeError(`maxSimSeconds must be a positive finite number: ${maxSimSeconds}`);
@@ -48,55 +51,81 @@ export function simulateShot(table, shot, opts = {}) {
     ball.body.position.set(start.x, BALL.radius, start.z);
     if (s.q) ball.body.quaternion.set(s.q[0], s.q[1], s.q[2], s.q[3]);
     ball.body.material = simWorld.materials.ball;
-    simWorld.world.addBody(ball.body);
+    addBody(simWorld, ball.body);
     balls.push(ball);
   }
 
-  const guards = createGuards(simWorld, balls);
+  let steps = 0;
+  const log = createEventLog();
+  const recorder = createEventRecorder(log, () => steps);
+  const guards = createGuards(simWorld, balls, {
+    onBallContact: (a, b, speed) => recorder.ballContact(a, b, speed),
+    onCushionContact: ball => recorder.cushionContact(ball, ball.body.velocity.length()),
+  });
   // Cannon cushion contacts transfer spin, as in Game.setupCollisionEvents.
   for (const ball of balls) {
     ball.body.addEventListener('collide', (/** @type {{ body: CANNON.Body }} */ e) => {
       if (e.body.material === simWorld.materials.cushion) guards.applyCushionSpin(ball);
     });
   }
+  // Contact starts seen by cannon, before its solver changes the velocities.
+  const ballByBody = new Map(balls.map(b => [b.body, b]));
+  simWorld.world.addEventListener('beginContact', (/** @type {{ bodyA: CANNON.Body, bodyB: CANNON.Body }} */ e) => {
+    const a = ballByBody.get(e.bodyA);
+    const b = ballByBody.get(e.bodyB);
+    if (a && b) {
+      recorder.ballContact(a, b, a.body.velocity.distanceTo(b.body.velocity));
+    } else if (a && e.bodyB.material === simWorld.materials.cushion) {
+      recorder.cushionContact(a, a.body.velocity.length());
+    } else if (b && e.bodyA.material === simWorld.materials.cushion) {
+      recorder.cushionContact(b, b.body.velocity.length());
+    }
+  });
 
   const cue = /** @type {SimBall} */ (balls.find(b => b.id === 0));
   applyCueImpulse(cue, Math.cos(shot.angle) * power, 0, Math.sin(shot.angle) * power, spinX, spinY);
 
+  // Sampling starts from the placed balls, before the stroke moves anything.
+  const sampler = createFrameSampler(balls);
   const maxSteps = Math.round(maxSimSeconds * STEPS_PER_SECOND);
-  let steps = 0;
   let stopped = false;
   while (steps < maxSteps) {
-    simWorld.world.step(STEP);
+    // Counted before the step so that events raised inside it carry its number.
     steps++;
+    simWorld.world.step(STEP);
     if (steps % GUARD_EVERY === 0) {
       guards.update(GUARD_DT);
-      guards.checkPockets();
-      if (guards.allStopped()) {
-        stopped = true;
-        break;
+      for (const p of guards.checkPockets()) {
+        recorder.pocket(p.id, p.pocketIndex);
+        sampler.pocketed(p.id, p.x, p.z);
       }
+      stopped = guards.allStopped();
     }
+    if (steps % SAMPLE_EVERY === 0) sampler.sample(steps);
+    if (stopped) break;
   }
 
   const byId = new Map(balls.map(b => [b.id, b]));
   const final = {
     tableProfileId: table.tableProfileId,
-    balls: states.map(s => {
+    balls: states.map(/** @returns {BallState} */ s => {
       const ball = byId.get(s.id);
-      if (!ball) return { id: s.id, x: s.x, z: s.z, pocketed: true };
-      return { id: s.id, x: ball.body.position.x, z: ball.body.position.z, pocketed: ball.pocketed };
+      if (!ball) return { id: s.id, x: s.x, z: s.z, q: s.q ? [s.q[0], s.q[1], s.q[2], s.q[3]] : [0, 0, 0, 1], pocketed: true };
+      return { id: s.id, x: ball.body.position.x, z: ball.body.position.z, q: quatOf(ball), pocketed: ball.pocketed };
     }),
   };
 
-  return {
-    frames: [],
-    events: [],
+  /** @type {ShotResult} */
+  const result = {
+    frames: sampler.frames,
+    events: log.events,
     final,
     steps,
     simSeconds: steps / STEPS_PER_SECOND,
     capped: !stopped,
   };
+  if (probe) result.probe = { v: cue.body.velocity.z, w: cue.body.angularVelocity.x };
+  return result;
 }
 
 /** @param {ShotInput} shot */

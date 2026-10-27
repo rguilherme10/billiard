@@ -5,7 +5,9 @@ import { UIText } from '../core/UIText.js';
  * GameStateSerializer — Serialize and deserialize game state for network sync.
  *
  * Host sends stateSnapshot every frame during shooting;
- * clients apply it to update visual positions without running physics.
+ * clients apply it to update visual positions without simulating.
+ * Balls travel as mesh poses (position + quaternion): the host plays each
+ * shot back from its trajectory, so the meshes are where the balls are.
  */
 export class GameStateSerializer {
   /**
@@ -17,45 +19,25 @@ export class GameStateSerializer {
     const balls = [];
     if (game.ballsManager) {
       for (const ball of game.ballsManager.balls) {
-        const b = ball.body;
+        const p = ball.mesh.position;
+        const q = ball.mesh.quaternion;
         balls.push({
           id: ball.id,
-          x: b.position.x,
-          y: b.position.y,
-          z: b.position.z,
-          vx: b.velocity.x,
-          vy: b.velocity.y,
-          vz: b.velocity.z,
-          avx: b.angularVelocity.x,
-          avy: b.angularVelocity.y,
-          avz: b.angularVelocity.z,
-          qx: b.quaternion.x,
-          qy: b.quaternion.y,
-          qz: b.quaternion.z,
-          qw: b.quaternion.w,
+          x: p.x,
+          y: p.y,
+          z: p.z,
+          qx: q.x,
+          qy: q.y,
+          qz: q.z,
+          qw: q.w,
           pocketed: ball.pocketed,
           visible: ball.mesh.visible,
         });
       }
     }
 
-    const rules = game.rules ? {
-      player1Group: game.rules.player1Group,
-      player2Group: game.rules.player2Group,
-      player1Pocketed: game.rules.player1Pocketed,
-      player2Pocketed: game.rules.player2Pocketed,
-      breakShot: game.rules.breakShot,
-      gameOver: game.rules.gameOver,
-      winner: game.rules.winner,
-      foul: game.rules.foul,
-      pocketedBalls: game.rules.pocketedBalls || [],
-      player1ConsecutiveFouls: game.rules.player1ConsecutiveFouls,
-      player2ConsecutiveFouls: game.rules.player2ConsecutiveFouls,
-      pushOutAvailable: game.rules.pushOutAvailable,
-      pushOutDeclared: game.rules.pushOutDeclared,
-      pushOutPending: game.rules.pushOutPending,
-      pushOutPlayer: game.rules.pushOutPlayer,
-    } : null;
+    // The match state (packages/modes) travels whole; the guest restores it.
+    const match = game.match?.toJSON?.() ?? null;
 
     return {
       mode: game.mode,
@@ -69,9 +51,10 @@ export class GameStateSerializer {
       turnTimer: { enabled: Boolean(game._turnTimerEnabled), max: game._turnTimerMax || 0,
         remaining: game._turnTimerRemaining || 0 },
       shotPower: game._lastShotPower || 0,
-      stats: game.statsTracker?.getSummary(game.rules?.winner) || null,
+      stats: game.statsTracker?.getSummary(game.match?.status?.()?.winner) || null,
       balls,
-      rules,
+      match,
+      pushOutDeclared: Boolean(game._pushOutDeclared),
       message: game.ui?._lastMessage || '',
       player1Name: game.networkPlayer1Name || '玩家 1',
       player2Name: game.networkPlayer2Name || '玩家 2',
@@ -88,7 +71,7 @@ export class GameStateSerializer {
 
   /**
    * Apply a remote snapshot to a Game instance (client-side).
-   * Does NOT step physics or resolve rules — only updates visuals and UI.
+   * Does NOT simulate a shot or resolve rules — only updates visuals and UI.
    * @param {Game} game
    * @param {object} snapshot
    */
@@ -133,7 +116,7 @@ export class GameStateSerializer {
       );
     }
 
-    // Update ball positions / velocities / rotations
+    // Update ball poses (a pocketed ball is hidden where it is)
     for (const bs of snapshot.balls) {
       const ball = game.ballsManager.getBall(bs.id);
       if (!ball) continue;
@@ -143,17 +126,8 @@ export class GameStateSerializer {
       ball.mesh.visible = bs.visible;
 
       if (!bs.pocketed) {
-        ball.body.position.set(bs.x, bs.y, bs.z);
-        ball.body.velocity.set(bs.vx, bs.vy, bs.vz);
-        ball.body.angularVelocity.set(bs.avx ?? 0, bs.avy ?? 0, bs.avz ?? 0);
-        ball.body.quaternion.set(bs.qx, bs.qy, bs.qz, bs.qw);
-        ball.sync();
-      } else {
-        // Keep pocketed balls out of the way
-        ball.body.position.set(0, -1000, 0);
-        ball.body.velocity.set(0, 0, 0);
-        ball.body.angularVelocity.set(0, 0, 0);
-        ball.sync();
+        ball.mesh.position.set(bs.x, bs.y, bs.z);
+        ball.mesh.quaternion.set(bs.qx, bs.qy, bs.qz, bs.qw);
       }
     }
 
@@ -175,7 +149,6 @@ export class GameStateSerializer {
     }
     if (snapshot.currentPlayer !== undefined) {
       game.currentPlayer = snapshot.currentPlayer;
-      if (game.rules) game.rules.currentPlayer = snapshot.currentPlayer;
       game.ui?.setPlayerTurn(snapshot.currentPlayer);
     }
     if (snapshot.ballInHand !== undefined) {
@@ -193,25 +166,9 @@ export class GameStateSerializer {
     }
     game.ui?.setHUDState?.(game.ballInHand ? 'BALL_IN_HAND' : game.state);
 
-    // Update rules state
-    if (snapshot.rules && game.rules) {
-      const rs = snapshot.rules;
-      if (rs.player1Group !== undefined) game.rules.player1Group = rs.player1Group;
-      if (rs.player2Group !== undefined) game.rules.player2Group = rs.player2Group;
-      if (rs.player1Pocketed !== undefined) game.rules.player1Pocketed = rs.player1Pocketed;
-      if (rs.player2Pocketed !== undefined) game.rules.player2Pocketed = rs.player2Pocketed;
-      if (rs.breakShot !== undefined) game.rules.breakShot = rs.breakShot;
-      if (rs.gameOver !== undefined) game.rules.gameOver = rs.gameOver;
-      if (rs.winner !== undefined) game.rules.winner = rs.winner;
-      if (rs.foul !== undefined) game.rules.foul = rs.foul;
-      if (rs.pocketedBalls !== undefined) game.rules.pocketedBalls = rs.pocketedBalls;
-      if (rs.player1ConsecutiveFouls !== undefined) game.rules.player1ConsecutiveFouls = rs.player1ConsecutiveFouls;
-      if (rs.player2ConsecutiveFouls !== undefined) game.rules.player2ConsecutiveFouls = rs.player2ConsecutiveFouls;
-      if (rs.pushOutAvailable !== undefined) game.rules.pushOutAvailable = rs.pushOutAvailable;
-      if (rs.pushOutDeclared !== undefined) game.rules.pushOutDeclared = rs.pushOutDeclared;
-      if (rs.pushOutPending !== undefined) game.rules.pushOutPending = rs.pushOutPending;
-      if (rs.pushOutPlayer !== undefined) game.rules.pushOutPlayer = rs.pushOutPlayer;
-    }
+    // Match state from the host's controller
+    if (snapshot.match !== undefined && game.match) game.match.restore(snapshot.match);
+    if (snapshot.pushOutDeclared !== undefined) game._pushOutDeclared = snapshot.pushOutDeclared;
 
     // Update UI labels for networked names
     if (snapshot.player1Name) game.networkPlayer1Name = snapshot.player1Name;
@@ -234,7 +191,8 @@ export class GameStateSerializer {
       game.audio?.playCueHit(snapshot.shotPower);
     }
     if (game.state === 'GAME_OVER' && previousState !== 'GAME_OVER') {
-      if (snapshot.rules?.winner === game.localPlayerId) game.audio?.playWin();
+      const winnerTeam = snapshot.match?.mode?.winnerTeam;
+      if (winnerTeam !== undefined && winnerTeam !== null && winnerTeam + 1 === game.localPlayerId) game.audio?.playWin();
       else game.audio?.playFoul();
       if (snapshot.stats) game.statsPanel?.showGameOver(snapshot.stats, false);
       game.ui?.showResetButton?.(() => game._onResetButtonClicked(), UIText.gameOverResetLabel);

@@ -44,6 +44,10 @@ test('production artifact on a GitHub Pages project path', { timeout: process.en
     }
   });
   const ready = () => page.waitForFunction(() => window.__menu && !document.getElementById('intro-screen'));
+  // Polls a Node-side condition (the script responses are collected here, not in the page).
+  const until = async (condition, ms = 5000) => {
+    for (const end = Date.now() + ms; !condition() && Date.now() < end;) await new Promise(resolve => setTimeout(resolve, 50));
+  };
 
   await t.test('project URL boots without source files or asset failures', async () => {
     await page.goto(origin + base.slice(0, -1), { waitUntil: 'networkidle2' });
@@ -51,8 +55,12 @@ test('production artifact on a GitHub Pages project path', { timeout: process.en
     assert.equal(page.url(), origin + base);
     assert.equal(await page.$eval('#version-tag', element => element.textContent), VERSION_TAG);
     assert.ok(await page.evaluate(() => __menu.renderer.renderer.getContext() instanceof WebGL2RenderingContext));
-    assert.ok(assets.length >= 3);
+    // The build is split: the entry chunk and the Three.js vendor chunk load at boot.
+    assert.ok(assets.some(url => /\/index-[^/]+\.js$/.test(url)));
+    assert.ok(assets.some(url => /\/three-[^/]+\.js$/.test(url)));
     assert.ok(assets.every(url => url.startsWith(origin + base + 'assets/')));
+    // The reference-shot hook is development only (main.js, import.meta.env.DEV).
+    assert.equal(await page.evaluate(() => typeof window.__referenceShot), 'undefined');
     assert.deepEqual(errors, []);
   });
 
@@ -82,6 +90,14 @@ test('production artifact on a GitHub Pages project path', { timeout: process.en
   await t.test('free play, pause and return work in the built bundle', async () => {
     await page.evaluate(() => [...document.querySelectorAll('button.menu-btn')].find(b => b.textContent.includes('单人练习')).click());
     await page.waitForFunction(() => __menu.game?.state === 'AIM' && __menu.state === 'PLAYING');
+    // The sim worker chunk (F1-B) takes the place of the old physics chunk: it loads with the game.
+    await until(() => assets.some(url => /\/sim\.worker-[^/]+\.js$/.test(url)));
+    assert.ok(assets.length >= 3);
+    assert.ok(assets.some(url => /\/index-[^/]+\.js$/.test(url)));
+    assert.ok(assets.some(url => /\/three-[^/]+\.js$/.test(url)));
+    assert.ok(assets.some(url => /\/sim\.worker-[^/]+\.js$/.test(url)));
+    assert.ok(assets.every(url => url.startsWith(origin + base + 'assets/')));
+    assert.deepEqual(errors, []);
     await page.keyboard.press('Escape');
     assert.equal(await page.evaluate(() => __menu.game.paused), true);
     await page.keyboard.press('Escape');
@@ -96,6 +112,22 @@ test('production artifact on a GitHub Pages project path', { timeout: process.en
       if (process.env.PAGES_SCREENSHOT) await page.screenshot({ path: `${process.env.PAGES_SCREENSHOT}.${width}.png` });
     }
     await page.setViewport({ width: 1440, height: 1000 });
+    await page.evaluate(() => __menu.game.onReturnToMenu());
+    await page.waitForFunction(() => __menu.state === 'MENU');
+  });
+
+  // After the free-play subtest on purpose: that one proves the worker chunk is fetched with the game,
+  // so the chunk must not have been loaded by an earlier shot.
+  await t.test('a free-play shot simulates in the bundled worker', async () => {
+    await page.evaluate(() => [...document.querySelectorAll('button.menu-btn')].find(b => b.textContent.includes('单人练习')).click());
+    await page.waitForFunction(() => __menu.game?.state === 'AIM' && __menu.state === 'PLAYING');
+    await page.evaluate(() => { const game = __menu.game; game.power = 40; game.state = 'SHOOTING'; game.shoot(); });
+    // Truthy, not `!== null`: a game without the worker pipeline has no `playback` at all.
+    await page.waitForFunction(() => Boolean(__menu.game.playback));
+    await page.waitForFunction(() => __menu.game.state === 'AIM' && __menu.game.playback === null, { timeout: 25000 });
+    assert.ok(assets.some(url => /\/sim\.worker-[^/]+\.js$/.test(url)));
+    assert.ok(assets.every(url => url.startsWith(origin + base + 'assets/')));
+    assert.deepEqual(errors, []);
     await page.evaluate(() => __menu.game.onReturnToMenu());
     await page.waitForFunction(() => __menu.state === 'MENU');
   });

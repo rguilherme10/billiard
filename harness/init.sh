@@ -1,7 +1,8 @@
 #!/bin/bash
 # Harness bootstrap: installs dependencies, runs the fast (Node-only) test
 # suites and prints where development stands. Safe to run repeatedly.
-# Update FAST_SUITES whenever the test layout changes (e.g. the F1 monorepo).
+# Update FAST_SUITES whenever the client's test layout changes; packages/*
+# are picked up on their own.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -18,8 +19,9 @@ if [ -x /opt/pw-browsers/chromium ]; then
 fi
 npm install --no-audit --no-fund --loglevel=error
 
-FAST_SUITES=(rules table lan ai audio instant-replay career ui-layout settings-audit
-  trainer-challenge-safety achievement-toast tournament highlight panels runtime)
+FAST_SUITES=(table lan ai audio instant-replay career ui-layout settings-audit
+  trainer-challenge-safety achievement-toast tournament highlight panels runtime
+  sim-worker trajectory-player local-match no-legacy-physics no-legacy-rules)
 failed=()
 for suite in "${FAST_SUITES[@]}"; do
   if ! npm run -s -w apps/client "test:$suite" > /dev/null 2>&1; then
@@ -27,8 +29,8 @@ for suite in "${FAST_SUITES[@]}"; do
   fi
 done
 
-# Workspace packages (packages/*) run their own test script.
-for pkg in packages/*/package.json; do
+# Workspace packages (packages/*, services/*) run their own test script. services/nakama runs only its unit tests here (the integration needs Docker, D051); services/sim tests its HTTP server inside the test process, so it needs no Docker.
+for pkg in packages/*/package.json services/*/package.json; do
   [ -f "$pkg" ] || continue
   ws=$(dirname "$pkg")
   if ! npm test -w "$ws" > /dev/null 2>&1; then

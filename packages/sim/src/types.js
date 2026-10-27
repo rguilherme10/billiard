@@ -40,7 +40,9 @@
  */
 
 /**
- * Trajectory sample at t = k / 30 s. Empty until F1-A Task 5.
+ * Trajectory sample at t = k / 30 s (every 12 steps), with only the balls
+ * that moved or turned since their previous sample. A ball pocketed since the
+ * previous frame appears once more, where it was detected in the pocket.
  * @typedef {{
  *   t: number,
  *   balls: { id: number, x: number, z: number, q: Quat }[],
@@ -48,20 +50,38 @@
  */
 
 /**
- * Timed shot event (t = step / 360). Empty until F1-A Task 4.
- * @typedef {{ t: number, type: string }} SimEvent
+ * Timed shot event, `t = step / 360`, in step order.
+ * - `ball_ball`: one per contact start, `a < b`; `speed` is the magnitude of
+ *   the relative velocity before the impact (for contacts the guards resolve,
+ *   its normal component).
+ * - `ball_cushion`: one per contact start; `speed` is the ball's speed.
+ * - `pocket`: `pocket` is the index in `getPocketPositions`.
+ * - `first_contact`: goes out with the first `ball_ball` of the cue ball.
+ * @typedef {(
+ *   { t: number, type: 'ball_ball', a: number, b: number, speed: number } |
+ *   { t: number, type: 'ball_cushion', ball: number, speed: number } |
+ *   { t: number, type: 'pocket', ball: number, pocket: number } |
+ *   { t: number, type: 'first_contact', ball: number }
+ * )} SimEvent
  */
 
 /**
+ * `probe` is for diagnostics only: it adds `ShotResult.probe`.
  * @typedef {{
  *   tuning?: Tuning,
  *   maxSimSeconds?: number,
+ *   probe?: boolean,
  * }} SimulateOptions
  */
 
 /**
+ * `final.balls` is sorted by id and carries every ball's `q` (identity for a
+ * ball pocketed in the input without one). `frames` stop at the last multiple
+ * of 12 steps; `final` covers the rest.
  * `steps` counts 1/360 s physics steps; `simSeconds = steps / 360`; `capped`
  * is true when the time limit ended the shot before every ball stopped.
+ * `probe` (only with `SimulateOptions.probe`) is the cue ball's velocity along
+ * z (`v`) and angular velocity about x (`w`) after the last step.
  * @typedef {{
  *   frames: Frame[],
  *   events: SimEvent[],
@@ -69,6 +89,7 @@
  *   steps: number,
  *   simSeconds: number,
  *   capped: boolean,
+ *   probe?: { v: number, w: number },
  * }} ShotResult
  */
 

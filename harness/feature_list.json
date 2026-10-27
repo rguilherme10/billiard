@@ -63,27 +63,27 @@
       "npm test na raiz passa todas as suítes existentes",
       "npm run build gera o cliente"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F1-02",
     "phase": "F1",
     "description": "packages/sim sem Three.js nem DOM, expondo simulateShot(estado, tacada)",
     "verification": [
-      "grep -rn \"from 'three'\" packages/sim não encontra nada",
+      "grep -rn \"from 'three'\" packages/sim/src não encontra nada; o teste de imports de table.test.js também recusa APIs de navegador e aleatoriedade (D040)",
       "testes unitários de packages/sim passam"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F1-03",
     "phase": "F1",
-    "description": "Passo fixo de 1/360 s, física customizada por passo, limite de 20 s simulados e eventos (ball_ball, ball_cushion, pocket, first_contact), incluindo o efeito de tabela",
+    "description": "Passo fixo de 1/360 s, física customizada a 60 Hz de tempo simulado (D036), limite de 20 s simulados e eventos (ball_ball, ball_cushion, pocket, first_contact), incluindo o efeito de tabela",
     "verification": [
       "teste: tacada com efeito lateral na tabela muda a velocidade angular como no legado",
       "teste: eventos de uma tacada de referência saem na ordem esperada"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F1-04",
@@ -93,7 +93,7 @@
       "teste de ida e volta: posições dentro de 0,005 cm e rotações com erro ≤ 0,001 rad",
       "cada tacada do corpus codificada ocupa até 48 KB; tamanhos registrados (D037)"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F1-05",
@@ -103,17 +103,17 @@
       "conjunto golden idêntico bit a bit em duas execuções seguidas",
       "o conjunto golden inclui tacadas de uma bola na tabela, ao menos 3 encaçapes simples e uma abertura (D033)"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F1-06",
     "phase": "F1",
     "description": "Teste de sensação contra a física legada, com tolerância medida no próprio legado (D033)",
     "verification": [
-      "tolerância de cada métrica = espalhamento legacy60 × legacy144 medido sobre o corpus da F1 e registrado no plano da F1 (D033)",
-      "distância percorrida e posição final do passo fixo dentro dessa tolerância em relação ao legacy60; conjunto de bolas encaçapadas igual (D033)"
+      "tolerância de cada métrica = envelope do legado em 14 taxas de quadro, alargado pelas margens da D038, medido sobre o corpus da F1 e registrado em packages/sim/test/feel/legacy-reference.json (D033, D038); em long-stun, pot-corner e pot-side, a referência é o sim calibrado, com as mesmas margens, registrada em packages/sim/test/feel/sim-reference.json (D041)",
+      "distância percorrida e posição final do passo fixo dentro dessa tolerância; conjunto de bolas encaçapadas igual ao da referência a 60 FPS (D033, D038, D041)"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F1-07",
@@ -122,7 +122,7 @@
     "verification": [
       "teste de navegador: partida de 8-ball contra a IA vai até o fim sem erros no console"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F2-01",
@@ -131,7 +131,7 @@
     "verification": [
       "testes de tipos e de invariantes (sempre há um lugar da vez até o fim) passam"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F2-02",
@@ -140,7 +140,7 @@
     "verification": [
       "os 28 testes de regras portados passam"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F2-03",
@@ -149,7 +149,7 @@
     "verification": [
       "testes de push-out, três faltas e bola mais baixa passam"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F2-04",
@@ -159,7 +159,7 @@
       "teste 2×2: ordem A1, B1, A2, B2",
       "teste de 5 lugares: eliminados são pulados"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F2-05",
@@ -169,7 +169,7 @@
       "suítes de navegador existentes passam",
       "partida local de 2 jogadores vai até o fim"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F3-01",
@@ -178,7 +178,7 @@
     "verification": [
       "docker compose up -d e o healthcheck do Nakama respondem em até 60 s"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F3-02",
@@ -187,7 +187,7 @@
     "verification": [
       "bot entra como convidado, vincula e-mail e entra de novo com e-mail na mesma conta"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F3-03",
@@ -197,7 +197,7 @@
       "RPC recusa username impróprio",
       "perfil de outro jogador é legível"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F3-04",
@@ -206,7 +206,7 @@
     "verification": [
       "bot A cria a sala; bot B entra pelo código"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F3-05",
@@ -215,7 +215,7 @@
     "verification": [
       "dois bots na fila formam uma partida"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F4-01",
@@ -225,7 +225,7 @@
       "chamada sem segredo é recusada",
       "simVersion desconhecida é recusada"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F4-02",
@@ -236,7 +236,7 @@
       "números não finitos → shot_rejected",
       "mais de 5 inválidas em 10 s → conexão removida"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F4-03",
@@ -246,7 +246,7 @@
       "os dois bots terminam a tacada com o mesmo estado final",
       "tempo esgotado conta como falta"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F4-04",
@@ -256,7 +256,7 @@
       "bot cai no meio da reprodução, volta e termina no mesmo estado",
       "shot_request repetido não gera segunda tacada"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F4-05",
@@ -265,7 +265,7 @@
     "verification": [
       "bot ausente por mais de 60 s perde por W.O."
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F4-06",
@@ -274,7 +274,7 @@
     "verification": [
       "partida concluída gera exatamente um registro em match_history"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F4-07",
@@ -284,7 +284,7 @@
       "teste de integração: dois bots jogam uma partida inteira de 8-ball",
       "docs/protocol.md descreve todos os códigos de operação"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F5-01",
@@ -468,7 +468,7 @@
     "verification": [
       "no mesmo processo e máquina, com GC forçado antes de cada tacada: mediana da abertura do packages/sim ≥ 1,3× mais rápida que o modelo fixed de spikes/sim-bench (20 execuções + 3 de aquecimento); p95 informado (D034)"
     ],
-    "passes": false
+    "passes": true
   },
   {
     "id": "F1-09",
@@ -478,6 +478,7 @@
       "tacada de referência com bola-alvo a 50 cm, força 60 e efeito y = −0,8: a branca volta depois do contato",
       "a mesma tacada no jogo, no navegador, tem o comportamento confirmado pelo usuário"
     ],
-    "passes": false
+    "passes": false,
+    "notes": "parte do sim feita na F1-A: com o TUNING da D041, a branca da draw-ref volta 61 cm (packages/sim/test/calibration.test.js); falta a confirmação no navegador (F1-B)"
   }
 ]

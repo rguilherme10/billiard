@@ -2,10 +2,13 @@ import * as THREE from 'three';
 import { Table } from './Table.js';
 import { Room } from './Room.js';
 import { BallsManager } from './BallsManager.js';
+import { ShotPlayback } from './ShotPlayback.js';
+import { TrajectoryPlayer } from '../sim/TrajectoryPlayer.js';
+import { simClient } from '../sim/SimWorkerClient.js';
 import { InputHandler } from '../input/InputHandler.js';
 import { Cue } from './Cue.js';
-import { Rules } from './Rules.js';
-import { NineBallRules } from './NineBallRules.js';
+import { LocalMatchController } from '../match/LocalMatchController.js';
+import { toTurnResult } from '../match/turnResult.js';
 import { AchievementSystem } from '../achievements/AchievementSystem.js';
 import { AchievementPanel } from '../achievements/AchievementPanel.js';
 import { UI } from '../ui/UI.js';
@@ -39,9 +42,8 @@ import { onboarding } from '../core/OnboardingStore.js';
 
 
 export class Game {
-  constructor(renderer, physics, audioManager = null) {
+  constructor(renderer, audioManager = null) {
     this.renderer = renderer;
-    this.physics = physics;
     this.scene = renderer.scene;
     this.camera = renderer.camera;
 
@@ -49,7 +51,8 @@ export class Game {
     this.ballsManager = null;
     this.input = null;
     this.cue = null;
-    this.rules = null;
+    /** @type {LocalMatchController | null} validates, simulates and decides each shot (F2) */
+    this.match = null;
     this.ui = new UI();
     // Use injected shared AudioManager, or create our own if standalone
     this.audio = audioManager || new AudioManager();
@@ -122,6 +125,18 @@ export class Game {
     this._isBreakShot = false;
     this._wasShiftCameraControl = false;
 
+    // Shots are simulated by packages/sim in a worker and played back from
+    // the trajectory. A shot whose token is no longer current was abandoned
+    // (reset, new rack, dispose) and its result is ignored.
+    this._simClient = simClient; // read through the simClient accessor (the match controller's)
+    this._shotRuling = null; // the match controller's ruling for the shot being played back
+    this._pushOutDeclared = false; // 9-ball: the next shot is a push-out
+    this._placedCueBall = null; // where ball in hand put the cue ball for the next shot
+    this.playback = null; // ShotPlayback of the shot on the table, if any
+    this.playbackRate = 1; // playback seconds per real second
+    this.lastShotResult = null; // SimResult of the last shot played back
+    this._shotToken = 0;
+
     // Turn timer
     this._turnTimerEnabled = false;
     this._turnTimerMax = 0; // seconds, 0 = off
@@ -133,7 +148,6 @@ export class Game {
     this.tableProfileId = null;
 
     // Listener refs for clean disposal
-    this._ballCollideListeners = new Map(); // ballId -> listener fn
     this._cueTipBallWrap = null;
     this._cueTipListeners = [];
 
@@ -175,15 +189,9 @@ export class Game {
       }
     }
 
-    // Create rules engine based on game mode
-    if (this.mode === 'trainer') {
-      // Trainer mode uses no rules engine — pure physics practice
-      this.rules = null;
-    } else if (this.mode === '9ball') {
-      this.rules = new NineBallRules();
-    } else {
-      this.rules = new Rules();
-    }
+    // The match controller decides with packages/modes; free play and the trainer have no rules.
+    const modeId = this.mode === 'trainer' || this.mode === 'freeplay' ? null : this.mode === '9ball' ? '9ball' : '8ball';
+    this.match = new LocalMatchController({ modeId, tableProfile: this.tableProfile, simClient: this._simClient });
 
     // Audio manager is already initialised by MenuSystem (shared singleton).
     // Game only calls init() when it owns a standalone instance.
@@ -205,7 +213,7 @@ export class Game {
     this._turnTimerRunning = false;
 
     this.achievements.onGameStart();
-    this.table = new Table(this.physics, this.tableProfile);
+    this.table = new Table(this.tableProfile);
     this.table.addToScene(this.scene);
     this.table.applyVisualSettings(settings);
 
@@ -213,17 +221,15 @@ export class Game {
     this.room.addToScene(this.scene);
     this.room.applyVisualSettings(settings);
 
-    this.ballsManager = new BallsManager(this.physics, this.tableProfile);
+    this.ballsManager = new BallsManager(this.tableProfile);
     this.ballsManager.createBalls();
     if (this.instantReplay) this.instantReplay.setBallsManager(this.ballsManager);
     if (this.mode === 'trainer' && this.drillConfig) {
       const { idealZone } = this.ballsManager.setupDrill(this.drillConfig, this.tableProfile);
       this.drillIdealZone = idealZone;
     } else {
-      const rackMode = this.mode === '9ball' ? '9ball' : '8ball';
-      this.ballsManager.rackBalls(rackMode);
+      this.ballsManager.applyLayout(this.match.newRack(this.currentPlayer - 1));
     }
-    this._wireBallsManagerEvents();
     this.ballsManager.addToScene(this.scene);
     // Apply ball visual settings after creation
     for (const ball of this.ballsManager.balls) {
@@ -360,7 +366,17 @@ export class Game {
       };
     }
 
-    this.setupCollisionEvents();
+    // Load the simulation worker now so the first shot does not wait for it.
+    // A worker that cannot start is reported by the first shot instead, which
+    // tries again and fails as a cancelled shot (_simulateShot). LAN guests
+    // never simulate: the host plays their shots.
+    if (this.networkRole !== 'client') {
+      try {
+        this.simClient.warm();
+      } catch (err) {
+        // Reported by the first shot.
+      }
+    }
 
     // Show game tutorial steps for new players
     this._showGameTutorial();
@@ -405,140 +421,136 @@ export class Game {
     this.aiPlayer = new AIPlayer(difficulty);
   }
 
-  setupCollisionEvents() {
-    for (const ball of this.ballsManager.balls) {
-      const listener = (e) => {
-        this._trackShotDistance(ball);
-        // In cannon-es, e.body is ALREADY the other body involved in the collision
-        const otherBody = e.body;
-        const otherBall = this.ballsManager.balls.find(b => b.body === otherBody);
-        const v = ball.body.velocity.length();
+  /* ── Shot events from the simulation, at the playback time they happen ── */
 
-        if (otherBall) {
-          // Ball-ball collision
-          // True relative velocity = vector difference magnitude (not scalar diff)
-          const relVel = ball.body.velocity.distanceTo(otherBall.body.velocity);
-
-          // First hit tracking (only for cue ball)
-          if (this.state === 'SHOOTING' && ball.id === 0 && otherBall.id !== 0) {
-            this.rules?.recordFirstHit(otherBall.id);
-            this.achievements.onBallCollision(relVel);
-            if (this.challengeManager) this.challengeManager.onBallCollision(ball, otherBall);
-            // Career: long-shot detection (distance > 150cm)
-            if (this._shotFirstHitDistance === 0) {
-              // Measure distance from cue ball's starting position, not center-to-center gap
-              this._shotFirstHitDistance = this._shotStartPosition
-                ? ball.mesh.position.distanceTo(this._shotStartPosition)
-                : 0;
-              if (this._shotFirstHitDistance > 150) {
-                this._shotIsLongShot = true;
-              }
-            }
-            // Career: bank shot = cushion hit before first ball contact
-            if (this._shotHadCushionBeforeHit) {
-              this._shotIsBank = true;
-            }
-            // Highlight tracking
-            this.recorder.setExtra({
-              firstHitDistance: this._shotFirstHitDistance,
-              isBank: this._shotIsBank,
-            });
-          }
-
-          // Deduplicate: cannon-es fires collide on BOTH bodies.
-          // Use lower ID as canonical to process each pair exactly once.
-          if (ball.id < otherBall.id) {
-            if (relVel > 0.5) {
-              this.audio?.playBallCollision(relVel);
-            }
-            if (this.state === 'SHOOTING') {
-              this.recorder.recordCollision();
-              if (relVel > 1.0) {
-                this.statsTracker.recordBallCollision(this.currentPlayer);
-                this._tmpVec3d
-                  .copy(ball.mesh.position)
-                  .add(otherBall.mesh.position)
-                  .multiplyScalar(0.5);
-                this.particles.spawnCollisionSparks(this._tmpVec3d, relVel);
-              }
-            }
-          }
-        } else if (otherBody.material === this.physics.cushionMaterial) {
-          // Ball-cushion collision
-          if (this.state === 'SHOOTING' && this._shotFirstHitDistance === 0) {
-            this._shotHadCushionBeforeHit = true;
-          }
-          this.ballsManager?.applyCushionSpin(ball);
-          if (this.state === 'SHOOTING') {
-            this.rules?.recordCushionHit?.(ball.id);
-          }
-          if (v > 0.8) {
-            this.audio?.playCushionBounce(v);
-          }
-
-          // Subtle cushion bounce dust for significant hits (restrained)
-          if (v > 1.2 && settings.get('particlesEnabled') !== false) {
-            this._tmpVec3d.set(ball.mesh.position.x, ball.mesh.position.y - BALL.radius * 0.5, ball.mesh.position.z);
-            this.particles.spawnCollisionSparks(this._tmpVec3d, v * 0.3);
-          }
-
-          if (this.state === 'SHOOTING' && v > 0.5) {
-            this.statsTracker.recordCushionCollision(this.currentPlayer);
-            this.achievements.onCushionCollision();
-            this.recorder.recordCushion();
-            if (this.challengeManager) this.challengeManager.onCushionHit(ball.id);
-          }
-        }
-      };
-      ball.body.addEventListener('collide', listener);
-      this._ballCollideListeners.set(ball.id, listener);
+  _onSimEvent(e) {
+    switch (e.type) {
+      case 'first_contact': this._onFirstContact(e.ball); break;
+      case 'ball_ball': this._onBallBallEvent(e.a, e.b, e.speed); break;
+      case 'ball_cushion': this._onCushionEvent(e.ball, e.speed); break;
+      case 'pocket': this._onPocketEvent(e.ball, e.pocket); break;
     }
   }
 
-  _wireBallsManagerEvents() {
-    if (!this.ballsManager) return;
-    this.ballsManager.onManualBallContact = (ballA, ballB, relVel) => {
-      this._handleManualBallContact(ballA, ballB, relVel);
-    };
-    this.ballsManager.onManualCushionContact = (ball) => {
-      if (this.state === 'SHOOTING') {
-        this.rules?.recordCushionHit?.(ball.id);
-      }
-    };
-  }
-
-  _handleManualBallContact(ballA, ballB, relVel) {
+  /** The cue ball touched its first object ball (`ballId`) of the shot. */
+  _onFirstContact(ballId) {
     if (this.state !== 'SHOOTING') return;
-
-    let hitBall = null;
-    if (ballA.id === 0 && ballB.id !== 0) {
-      hitBall = ballB;
-      this.rules?.recordFirstHit(ballB.id);
-      this.achievements.onBallCollision(relVel);
-      if (this.challengeManager) this.challengeManager.onBallCollision(ballA, ballB);
-    } else if (ballB.id === 0 && ballA.id !== 0) {
-      hitBall = ballA;
-      this.rules?.recordFirstHit(ballA.id);
-      this.achievements.onBallCollision(relVel);
-      if (this.challengeManager) this.challengeManager.onBallCollision(ballA, ballB);
-    }
-    // Track highlight metadata for manual placement collisions too
-    if (hitBall && this._shotFirstHitDistance === 0) {
-      // Always measure from the cue ball (id === 0), not the hit ball
-      const cueBallMesh = ballA.id === 0 ? ballA.mesh : ballB.mesh;
-      this._shotFirstHitDistance = this._shotStartPosition
-        ? cueBallMesh.position.distanceTo(this._shotStartPosition)
+    // Career: long-shot detection (distance > 150cm)
+    if (this._shotFirstHitDistance === 0) {
+      // Measure distance from cue ball's starting position, not center-to-center gap
+      const cueBall = this.ballsManager.getCueBall();
+      this._shotFirstHitDistance = this._shotStartPosition && cueBall
+        ? cueBall.mesh.position.distanceTo(this._shotStartPosition)
         : 0;
       if (this._shotFirstHitDistance > 150) {
         this._shotIsLongShot = true;
       }
-      if (this._shotHadCushionBeforeHit) {
-        this._shotIsBank = true;
+    }
+    // Career: bank shot = cushion hit before first ball contact
+    if (this._shotHadCushionBeforeHit) {
+      this._shotIsBank = true;
+    }
+    // Highlight tracking
+    this.recorder.setExtra({
+      firstHitDistance: this._shotFirstHitDistance,
+      isBank: this._shotIsBank,
+    });
+  }
+
+  /** Balls `a` < `b` collided; `speed` is their relative speed before the impact. */
+  _onBallBallEvent(a, b, speed) {
+    const ballA = this.ballsManager.getBall(a);
+    const ballB = this.ballsManager.getBall(b);
+    if (!ballA || !ballB) return;
+    this._trackShotDistance(ballA);
+    this._trackShotDistance(ballB);
+
+    // Cue ball against an object ball (the cue ball has the lower id)
+    if (this.state === 'SHOOTING' && a === 0) {
+      this.achievements.onBallCollision(speed);
+      if (this.challengeManager) this.challengeManager.onBallCollision(ballA, ballB);
+    }
+
+    if (speed > 0.5) {
+      this.audio?.playBallCollision(speed);
+    }
+    if (this.state === 'SHOOTING') {
+      this.recorder.recordCollision();
+      if (speed > 1.0) {
+        this.statsTracker.recordBallCollision(this.currentPlayer);
+        this._tmpVec3d
+          .copy(ballA.mesh.position)
+          .add(ballB.mesh.position)
+          .multiplyScalar(0.5);
+        this.particles.spawnCollisionSparks(this._tmpVec3d, speed);
       }
-      this.recorder.setExtra({
-        firstHitDistance: this._shotFirstHitDistance,
-        isBank: this._shotIsBank,
-      });
+    }
+  }
+
+  /** A ball hit a cushion at `speed`. */
+  _onCushionEvent(ballId, speed) {
+    const ball = this.ballsManager.getBall(ballId);
+    if (!ball) return;
+    this._trackShotDistance(ball);
+    if (this.state === 'SHOOTING' && this._shotFirstHitDistance === 0) {
+      this._shotHadCushionBeforeHit = true;
+    }
+    if (this.state === 'SHOOTING') {
+    }
+    if (speed > 0.8) {
+      this.audio?.playCushionBounce(speed);
+    }
+
+    // Subtle cushion bounce dust for significant hits (restrained)
+    if (speed > 1.2 && settings.get('particlesEnabled') !== false) {
+      this._tmpVec3d.set(ball.mesh.position.x, ball.mesh.position.y - BALL.radius * 0.5, ball.mesh.position.z);
+      this.particles.spawnCollisionSparks(this._tmpVec3d, speed * 0.3);
+    }
+
+    if (this.state === 'SHOOTING' && speed > 0.5) {
+      this.statsTracker.recordCushionCollision(this.currentPlayer);
+      this.achievements.onCushionCollision();
+      this.recorder.recordCushion();
+      if (this.challengeManager) this.challengeManager.onCushionHit(ball.id);
+    }
+  }
+
+  /** Ball `ballId` dropped into the pocket at index `pocketIndex` of getPocketPositions(). */
+  _onPocketEvent(ballId, pocketIndex) {
+    const ball = this.ballsManager.getBall(ballId);
+    if (ball && !ball.pocketed) ball.remove();
+    this.audio?.playPocket();
+    const pocket = (this.table?.getPocketPositions?.() || [])[pocketIndex];
+    if (!pocket) return;
+    if (this.turnPocketedIds.includes(ballId)) return;
+
+    this.turnPocketedIds.push(ballId);
+    this.achievements.onPocket(ballId, pocket, this.mode);
+    this.recorder.recordPocket(ballId);
+    if (this.challengeManager) this.challengeManager.onPocket(ballId);
+    if (this.drillManager) this.drillManager.onPocket(ballId);
+    if (ball && this.ballReturn && ballId !== 0 && settings.get('ballReturnAnimationEnabled') !== false) {
+      this.ballReturn.animateBallReturn(ball.mesh, pocket);
+    }
+    this.particles.spawnPocketFlash(pocket);
+    if (settings.get('pocketFountainEnabled') !== false) {
+      this.particles.spawnPocketFountain(pocket, ballId);
+    }
+    if (this.renderer?.camera && this.renderer.width > 0 && this.renderer.height > 0) {
+      const p = this._tmpVec3a.set(pocket.x, pocket.y + 15, pocket.z);
+      p.project(this.renderer.camera);
+      const sx = (p.x * 0.5 + 0.5) * this.renderer.width;
+      const sy = (-p.y * 0.5 + 0.5) * this.renderer.height;
+      // Skip floating text in spectator mode (broadcast overlay provides its own feedback)
+      if (!this.bothAI) {
+        const txt = ballId === 8 ? '🎱 8号球!' : (ballId === 0 ? '⚠️ 白球' : `+${ballId}`);
+        const col = ballId === 0 ? '#ff6b6b' : (ballId === 8 ? '#fff' : '#d8b15f');
+        this.ui.showFloatingText(txt, sx, sy, col);
+      }
+    }
+    // Broadcast pocket FX to clients so they see the same visual feedback
+    if (this.networkRole === 'host' && this.networkController) {
+      this.networkController.sendPocketEvent(ballId, pocketIndex, { x: pocket.x, y: pocket.y, z: pocket.z });
     }
   }
 
@@ -581,7 +593,7 @@ export class Game {
       return;
     }
     // Block shot while push-out choice is pending
-    if (this.rules?.pushOutPending && this.isLocalPlayerTurn()) {
+    if (this.match?.status()?.pushOutPending && this.isLocalPlayerTurn()) {
       this.ui.setMessage(UIText.pushOutMustChoose, 2000, 1);
       return;
     }
@@ -805,8 +817,8 @@ export class Game {
 
     for (const ball of this.ballsManager.balls) {
       if (ball.id === 0 || ball.pocketed) continue;
-      const dx = x - ball.body.position.x;
-      const dz = z - ball.body.position.z;
+      const dx = x - ball.mesh.position.x;
+      const dz = z - ball.mesh.position.z;
       if (dx * dx + dz * dz < (BALL.radius * 2.15) ** 2) {
         return 'NEAR_BALL';
       }
@@ -933,7 +945,7 @@ export class Game {
     if (this.ballInHand) return;
 
     // Block shot while push-out choice is pending
-    if (this.rules?.pushOutPending && this.isLocalPlayerTurn()) {
+    if (this.match?.status()?.pushOutPending && this.isLocalPlayerTurn()) {
       this.ui.setMessage(UIText.pushOutMustChoose, 2000, 1);
       return;
     }
@@ -963,7 +975,7 @@ export class Game {
       this.dragStart = null;
       if (settings.get('hideCueOnShot') !== false && this.cue) this.cue.hide();
       this.trajectory.setVisible(false);
-      // Local immediate feedback: audio + FX (host will authoritatively resolve physics)
+      // Local immediate feedback: audio + FX (host will authoritatively resolve the shot)
       this.audio?.playCueHit(force);
       this.particles.spawnChalkDust(cueBall.mesh.position, this.aimDirection, force);
       if (settings.get('impactShockwaveEnabled') !== false) {
@@ -988,19 +1000,12 @@ export class Game {
     }
 
     // Track whether this shot is the break shot for achievement purposes
-    this._isBreakShot = this.rules?.breakShot || false;
-    this.rules?.startShot(this.currentPlayer);
+    this._isBreakShot = this.match?.status()?.breakShot || false;
 
     const force = Math.max(safePower, SHOT.minPower);
-    cueBall.applyImpulse(
-      this.aimDirection.x * force,
-      0,
-      this.aimDirection.z * force,
-      this.cueTipOffset.x,
-      this.cueTipOffset.y
-    );
-
-    this.audio?.playCueHit(force);
+    // The cue hits the ball when the balls start moving: the playback may wait
+    // for the worker (_startPlayback).
+    this._simulateShot(force, { force, at: cueBall.mesh.position.clone(), direction: this.aimDirection.clone() });
 
     // Stats & effects
     this.turnPocketedIds = [];
@@ -1012,20 +1017,6 @@ export class Game {
     this.achievements.onShot(cueBall, powerPercent, this.cueTipOffset, this.currentPlayer, trackAchievements);
     this.challengeManager?.onShot(cueBall, powerPercent, this.cueTipOffset, this.currentPlayer);
     this.drillManager?.onShot(cueBall, powerPercent, this.cueTipOffset);
-    this.particles.spawnChalkDust(
-      cueBall.mesh.position,
-      this.aimDirection,
-      force
-    );
-    if (settings.get('impactShockwaveEnabled') !== false) {
-      this.shockwaves?.spawn(cueBall.mesh.position, force);
-    }
-    if (settings.get('cameraShake') !== false) {
-      this.screenShake?.trigger(force, this.aimDirection);
-    }
-    if (settings.get('vibrationEnabled')) {
-      try { navigator.vibrate?.(30 + force); } catch (e) {}
-    }
     this.powerLabel?.show(force);
     this.trails.startRecording(cueBall);
     this.recorder.start(this.ballsManager, this.mode, force / SHOT.maxPower * 100, this.cueTipOffset, this.tableProfileId);
@@ -1037,8 +1028,80 @@ export class Game {
     this._shotHadCushionBeforeHit = false;
     this._shotStartPosition = cueBall.mesh.position.clone();
 
+    // Auto-switch to follow mode if enabled
+    if (settings.get('autoFollowCueBall') && this.cameraMode !== 'follow') {
+      this.cameraMode = 'follow';
+    }
+  }
+
+  /**
+   * Simulates the shot in the worker and starts playing it back when the
+   * result arrives. A shot without force moves nothing: it plays an empty
+   * result at once, without the worker (the sim refuses power <= 0).
+   * `impact` is the cue hit that plays with the playback (_playShotImpact).
+   */
+  _simulateShot(force, impact) {
+    const table = this.ballsManager.toTableState(this.tableProfileId);
+    const token = ++this._shotToken;
+    this.playback = null;
+    // The tip offset never leaves the unit circle (the AI can propose more, and
+    // the match refuses it), as ShotInput does for a LAN shot.
+    const spinLength = Math.max(1, Math.hypot(this.cueTipOffset.x, this.cueTipOffset.y));
+    const shot = {
+      angle: Math.atan2(this.aimDirection.z, this.aimDirection.x),
+      power: force,
+      spin: { x: this.cueTipOffset.x / spinLength, y: this.cueTipOffset.y / spinLength },
+    };
+    if (this._pushOutDeclared) shot.pushOut = true;
+    if (this._placedCueBall) shot.cueBall = this._placedCueBall;
+    // The result only counts for the shot still on the table.
+    const live = () => token === this._shotToken && this.state === 'SHOOTING';
+    let request;
+    try {
+      request = this.match.submitShot(table, shot);
+    } catch (err) {
+      request = Promise.reject(err);
+    }
+    Promise.resolve(request)
+      .then(({ initial, result, ruling }) => {
+        if (!live()) return;
+        this._pushOutDeclared = false;
+        this._placedCueBall = null;
+        this._shotRuling = ruling;
+        this._startPlayback(initial, result, impact);
+      })
+      .catch(err => { if (!err?.stale && live()) this._cancelShot(table, err); });
+  }
+
+  _startPlayback(table, result, impact) {
+    // With the radius, a fast ball turns the way it rolls between samples.
+    const player = new TrajectoryPlayer({ initial: table, ...result, ballRadius: BALL.radius });
+    this.lastShotResult = result;
+    this.playback = new ShotPlayback(this.ballsManager, player);
+    if (impact) this._playShotImpact(impact);
+  }
+
+  /**
+   * The cue hits the ball: sound, chalk, shockwave, shake and vibration, and
+   * the cue touches the ball for a moment before it hides.
+   * @param {{ force: number, at: THREE.Vector3, direction: THREE.Vector3 }} impact
+   *   the shot's force, and the cue ball position and aim when it was taken
+   */
+  _playShotImpact({ force, at, direction }) {
+    this.audio?.playCueHit(force);
+    this.particles.spawnChalkDust(at, direction, force);
+    if (settings.get('impactShockwaveEnabled') !== false) {
+      this.shockwaves?.spawn(at, force);
+    }
+    if (settings.get('cameraShake') !== false) {
+      this.screenShake?.trigger(force, direction);
+    }
+    if (settings.get('vibrationEnabled')) {
+      try { navigator.vibrate?.(30 + force); } catch (e) {}
+    }
+
     // Strike snap: cue visually touches the ball for one frame before hiding
-    if (this.cue) this.cue.strikeSnap(cueBall.mesh.position, this.aimDirection);
+    if (this.cue) this.cue.strikeSnap(at, direction);
     if (this._strikeHideTimer) clearTimeout(this._strikeHideTimer);
     const hideCue = settings.get('hideCueOnShot') !== false;
     this._strikeHideTimer = setTimeout(() => {
@@ -1046,10 +1109,64 @@ export class Game {
       if (this.trajectory) this.trajectory.setVisible(false);
       this._strikeHideTimer = null;
     }, animMs(70));
+  }
 
-    // Auto-switch to follow mode if enabled
-    if (settings.get('autoFollowCueBall') && this.cameraMode !== 'follow') {
-      this.cameraMode = 'follow';
+  /** The shot could not be simulated: the balls stay put and the player aims again. */
+  _cancelShot(table, err) {
+    if (!err?.rejected) console.warn('[Game] shot simulation failed, the shot is cancelled:', err);
+    this.ballsManager.applyTableState(table);
+    if (this._strikeHideTimer) { clearTimeout(this._strikeHideTimer); this._strikeHideTimer = null; }
+    this.trails.stopRecording();
+    this.recorder.reset();
+    this._enterAimState();
+    this.ui.setMessage(err?.rejected ? UIText.shotRejected : UIText.shotSimulationFailed, 3000, 2);
+    // Nobody else would start the AI's turn again.
+    if (this._shouldTriggerAI()) this.startAITurn();
+  }
+
+  /** Forgets the shot in progress: its pending result and its playback. */
+  _abandonShot() {
+    this._shotToken++;
+    this.playback = null;
+    this._shotRuling = null;
+  }
+
+  /** The shot simulator is the match controller's (tests may swap it). */
+  get simClient() {
+    return this.match?.simClient ?? this._simClient;
+  }
+
+  set simClient(client) {
+    this._simClient = client;
+    if (this.match) this.match.simClient = client;
+  }
+
+  /** The match controller's ruling in the shape resolveTurn consumes. */
+  _turnResult(ruling) {
+    return toTurnResult(this.match.modeId, ruling, this.match.status(), [this.networkPlayer1Name, this.networkPlayer2Name]);
+  }
+
+  /** Ball in hand ended: the next shot tells the match where the cue ball went. */
+  _rememberCueBallPlacement() {
+    const cue = this.ballsManager?.getCueBall();
+    if (this.match?.mode && cue) this._placedCueBall = { x: cue.mesh.position.x, z: cue.mesh.position.z };
+  }
+
+  /** Plays the shot forward by `dt` and resolves the turn when it ends. */
+  _advancePlayback(dt) {
+    const playback = this.playback;
+    // Handling an event can abandon the shot, or end its turn some other way
+    // (a forced result, a game over): then nothing more of it plays here.
+    const over = () => this.playback !== playback || this.state !== 'SHOOTING';
+    const { events, done } = playback.update(dt * this.playbackRate);
+    for (const e of events) {
+      this._onSimEvent(e);
+      if (over()) return;
+    }
+    if (over()) return;
+    if (done) {
+      this.playback = null;
+      this.resolveTurn(this.turnPocketedIds);
     }
   }
 
@@ -1208,82 +1325,15 @@ export class Game {
     if (this.state === 'DISPOSED') return;
     if (this.paused || this._hostPaused) return;
     const isClient = this.networkRole === 'client';
-    const pocketPositions = this.table?.getPocketPositions?.() || [];
 
-    if (!isClient && this.state !== 'REPLAYING' && this.ballsManager) {
-      this.ballsManager.updatePhysicsGuards(dt, pocketPositions);
-      this.ballsManager.sync();
-    }
+    // A playback only runs while its shot is SHOOTING. If the turn ended some
+    // other way (forced result, game over), the shot is dropped as it stands.
+    if (this.playback && this.state !== 'SHOOTING') this._abandonShot();
 
     if (this.state === 'SHOOTING') {
-      if (!isClient) {
-        // Physics safety timeout: force turn resolution after 20s
-        if (!this._shotStartTime) this._shotStartTime = performance.now();
-        if (performance.now() - this._shotStartTime > 20000) {
-          for (const ball of this.ballsManager.balls) {
-            ball.body.velocity.setZero();
-            ball.body.angularVelocity.setZero();
-            ball.body.force.setZero();
-            ball.body.torque.setZero();
-            ball.body.sleep();
-          }
-          this.resolveTurn(this.turnPocketedIds);
-          this._shotStartTime = null;
-          return;
-        }
-        const newlyPocketed = this.ballsManager.checkPockets(pocketPositions);
-
-        if (newlyPocketed.length > 0) {
-          this.audio?.playPocket();
-          const flashed = new Set();
-          for (const entry of newlyPocketed) {
-            const pocket = pocketPositions[entry.pocketIndex];
-            if (!pocket) continue;
-            const isFirstTime = !this.turnPocketedIds.includes(entry.id);
-            if (isFirstTime) {
-              this.turnPocketedIds.push(entry.id);
-              this.achievements.onPocket(entry.id, pocket, this.mode);
-              this.recorder.recordPocket(entry.id);
-              if (this.challengeManager) this.challengeManager.onPocket(entry.id);
-              if (this.drillManager) this.drillManager.onPocket(entry.id);
-              const pBall = this.ballsManager.getBall(entry.id);
-              if (pBall && this.ballReturn && entry.id !== 0 && settings.get('ballReturnAnimationEnabled') !== false) {
-                this.ballReturn.animateBallReturn(pBall.mesh, pocket);
-              }
-            }
-            if (isFirstTime) {
-              if (!flashed.has(entry.pocketIndex)) {
-                flashed.add(entry.pocketIndex);
-                this.particles.spawnPocketFlash(pocket);
-              }
-              if (settings.get('pocketFountainEnabled') !== false) {
-                this.particles.spawnPocketFountain(pocket, entry.id);
-              }
-              if (this.renderer?.camera && this.renderer.width > 0 && this.renderer.height > 0) {
-                const p = this._tmpVec3a.set(pocket.x, pocket.y + 15, pocket.z);
-                p.project(this.renderer.camera);
-                const sx = (p.x * 0.5 + 0.5) * this.renderer.width;
-                const sy = (-p.y * 0.5 + 0.5) * this.renderer.height;
-                // Skip floating text in spectator mode (broadcast overlay provides its own feedback)
-                if (!this.bothAI) {
-                  const txt = entry.id === 8 ? '🎱 8号球!' : (entry.id === 0 ? '⚠️ 白球' : `+${entry.id}`);
-                  const col = entry.id === 0 ? '#ff6b6b' : (entry.id === 8 ? '#fff' : '#d8b15f');
-                  this.ui.showFloatingText(txt, sx, sy, col);
-                }
-              }
-              // Broadcast pocket FX to clients so they see the same visual feedback
-              if (this.networkRole === 'host' && this.networkController) {
-                this.networkController.sendPocketEvent(entry.id, entry.pocketIndex, { x: pocket.x, y: pocket.y, z: pocket.z });
-              }
-            }
-          }
-        }
-
-        if (this.ballsManager.allStopped()) {
-          this._shotStartTime = null;
-          this.resolveTurn(this.turnPocketedIds);
-          if (this.state === 'DISPOSED') return;
-        }
+      if (this.playback) {
+        this._advancePlayback(dt);
+        if (this.state === 'DISPOSED') return;
       }
 
       const cueBall = this.ballsManager.getCueBall();
@@ -1378,9 +1428,10 @@ export class Game {
     }
 
     // Sync 9-ball push-out UI
-    if (this.mode === '9ball' && this.rules && this.state === 'AIM' && !this.ballInHand && !this.rules.gameOver) {
-      const status = this.rules.getStatus();
-      if (status.pushOutAvailable && this.isLocalPlayerTurn()) {
+    const nineBallStatus = this.mode === '9ball' ? this.match?.status() : null;
+    if (nineBallStatus && this.state === 'AIM' && !this.ballInHand && !nineBallStatus.gameOver) {
+      const status = nineBallStatus;
+      if (status.pushOutAvailable && !this._pushOutDeclared && this.isLocalPlayerTurn()) {
         this.ui.showPushOutButton(() => this._onPushOutClicked());
       } else {
         this.ui.hidePushOutButton();
@@ -1455,17 +1506,11 @@ export class Game {
       this._turnTimerRunning = false;
       return;
     }
-    const otherPlayer = this.currentPlayer === 1 ? 2 : 1;
-    const cName = this.currentPlayer === 1 ? this.networkPlayer1Name : this.networkPlayer2Name;
-    const oName = otherPlayer === 1 ? this.networkPlayer1Name : this.networkPlayer2Name;
-    this.rules.startShot(this.currentPlayer);
-    this.rules.foul = true;
-    this.rules.foulReason = 'TIMEOUT';
-    const result = { nextPlayer: otherPlayer, foul: true, scratch: false,
-      ballInHand: true, reasonCode: 'TIMEOUT', message: UIText.turnTimeout(cName, oName) };
+    if (!this.match?.mode) return;
+    this._pushOutDeclared = false;
+    const result = this._turnResult(this.match.timeout());
     this._isBreakShot = false;
-    this.resolveTurn([], this.rules._applyConsecutiveFouls
-      ? this.rules._applyConsecutiveFouls(result, otherPlayer) : result);
+    this.resolveTurn([], result);
   }
 
   /* ── Small helpers extracted from duplicated code ── */
@@ -1507,8 +1552,46 @@ export class Game {
     }
   }
 
+  /** Puts the cue ball on the first legal spot of a grid near the head end (used when no mouse picks the spot). */
+  _placeCueBallInHand(behindLine) {
+    const cue = this.ballsManager.getCueBall();
+    // Find a legal cue-ball placement
+    let placed = false;
+    const headStringZ = -this.tableProfile.depth / 2 * 0.55;
+    const candidates = [];
+    if (behindLine) {
+      // Behind head string: scan along a line slightly behind the string
+      for (let x = 0; x <= 10; x++) {
+        candidates.push({ x: x * BALL.radius * 2.5, z: headStringZ - BALL.radius * 2 });
+        if (x > 0) candidates.push({ x: -x * BALL.radius * 2.5, z: headStringZ - BALL.radius * 2 });
+      }
+    } else {
+      // Full ball-in-hand: scan a grid near the head end
+      for (let x = 0; x <= 6; x++) {
+        for (let z = -3; z <= 0; z++) {
+          candidates.push({ x: x * BALL.radius * 2.5, z: headStringZ + z * BALL.radius * 2.5 });
+          if (x > 0) candidates.push({ x: -x * BALL.radius * 2.5, z: headStringZ + z * BALL.radius * 2.5 });
+        }
+      }
+    }
+    for (const pos of candidates) {
+      if (this.isCueBallPlacementLegal(pos.x, pos.z, behindLine)) {
+        cue?.reset(pos.x, BALL.radius, pos.z);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      // Fallback: let resetCueBallIfPocketed pick a spot
+      const fallback = this.ballsManager.resetCueBallIfPocketed(0, headStringZ - BALL.radius * 2);
+      cue?.reset(fallback.x, BALL.radius, fallback.z);
+    }
+    this._rememberCueBallPlacement();
+  }
+
   /** Common ball-in-hand cleanup after placement is confirmed. */
   _endBallInHand() {
+    this._rememberCueBallPlacement();
     this.ballInHand = false;
     this.ballInHandValid = false;
     this.ballInHandBehindLine = false;
@@ -1583,9 +1666,9 @@ export class Game {
 
   /** Player clicked the Push-out button. */
   _onPushOutClicked() {
-    if (!this.rules || this.mode !== '9ball') return;
-    const declared = this.rules.declarePushOut();
-    if (!declared) return;
+    const status = this.mode === '9ball' ? this.match?.status() : null;
+    if (!status?.pushOutAvailable || status.pushOutPending || this._pushOutDeclared) return;
+    this._pushOutDeclared = true;
     this.ui.hidePushOutButton();
     this.ui.setMessage(UIText.pushOutTooltip, 3000, 1);
     if (this.networkMode && this.networkRole === 'client') {
@@ -1613,14 +1696,8 @@ export class Game {
 
   /** Apply push-out choice (accept/pass) and update game state. */
   _applyPushOutChoice(choice) {
-    if (!this.rules || !this.rules.pushOutPending) return;
-    let result;
-    if (choice === 'accept') {
-      result = this.rules.acceptPushOut();
-    } else {
-      result = this.rules.passPushOut();
-    }
-    if (!result) return;
+    if (!this.match?.status()?.pushOutPending) return;
+    const result = { nextPlayer: this.match.choosePushOut(choice === 'accept').nextSeat + 1 };
 
     this.currentPlayer = result.nextPlayer;
     this._turnTimerRemaining = this._turnTimerMax;
@@ -1654,8 +1731,8 @@ export class Game {
     const checkClear = (x, z) => {
       for (const b of this.ballsManager.balls) {
         if (b.id === ballId || b.pocketed) continue;
-        const dx = b.body.position.x - x;
-        const dz = b.body.position.z - z;
+        const dx = b.mesh.position.x - x;
+        const dz = b.mesh.position.z - z;
         if (dx * dx + dz * dz < (BALL.radius * 2.2) ** 2) return false;
       }
       return true;
@@ -1669,7 +1746,6 @@ export class Game {
     ball.pocketed = false;
     ball.mesh.visible = true;
     ball.setPosition(finalX, BALL.radius, footZ);
-    if (!this.physics.world.bodies.includes(ball.body)) this.physics.addBody(ball.body);
   }
 
   /** Remove challenge HUD if present. */
@@ -1835,7 +1911,9 @@ export class Game {
       return;
     }
 
-    const result = forcedResult || this.rules.resolveShot(pocketedIds, cuePocketed);
+    if (!forcedResult && !this._shotRuling) throw new Error('resolveTurn: no ruling for this shot');
+    const result = forcedResult || this._turnResult(this._shotRuling);
+    this._shotRuling = null;
 
     // Respot 8-ball or 9-ball if pocketed on break / foul
     if (result.respotEightBall) this._respotBall(8);
@@ -1951,7 +2029,7 @@ export class Game {
     this._turnTimerRemaining = this._turnTimerMax;
     this.ui.setPlayerTurn(this.currentPlayer);
 
-    const status = this.rules.getStatus();
+    const status = this.match.status();
     this.ui.setPlayerGroups(status.player1Group, status.player2Group);
     this._updatePlayerStats();
 
@@ -1970,8 +2048,8 @@ export class Game {
     }
 
     // Three-foul warning badge
-    const p1Fouls = this.rules.player1ConsecutiveFouls;
-    const p2Fouls = this.rules.player2ConsecutiveFouls;
+    const p1Fouls = status.player1ConsecutiveFouls;
+    const p2Fouls = status.player2ConsecutiveFouls;
     if (p1Fouls >= 2 || p2Fouls >= 2) {
       this.ui.showThreeFoulWarning();
     } else {
@@ -2029,40 +2107,9 @@ export class Game {
     if (this._shouldTriggerAI()) {
       if (this.ballInHand) {
         this.ballInHand = false;
-        const cue = this.ballsManager.getCueBall();
         const behindLine = this.ballInHandBehindLine;
         this.ballInHandBehindLine = false;
-        // Find a legal cue-ball placement for AI
-        let placed = false;
-        const headStringZ = -this.tableProfile.depth / 2 * 0.55;
-        const candidates = [];
-        if (behindLine) {
-          // Behind head string: scan along a line slightly behind the string
-          for (let x = 0; x <= 10; x++) {
-            candidates.push({ x: x * BALL.radius * 2.5, z: headStringZ - BALL.radius * 2 });
-            if (x > 0) candidates.push({ x: -x * BALL.radius * 2.5, z: headStringZ - BALL.radius * 2 });
-          }
-        } else {
-          // Full ball-in-hand: scan a grid near the head end
-          for (let x = 0; x <= 6; x++) {
-            for (let z = -3; z <= 0; z++) {
-              candidates.push({ x: x * BALL.radius * 2.5, z: headStringZ + z * BALL.radius * 2.5 });
-              if (x > 0) candidates.push({ x: -x * BALL.radius * 2.5, z: headStringZ + z * BALL.radius * 2.5 });
-            }
-          }
-        }
-        for (const pos of candidates) {
-          if (this.isCueBallPlacementLegal(pos.x, pos.z, behindLine)) {
-            cue?.reset(pos.x, BALL.radius, pos.z);
-            placed = true;
-            break;
-          }
-        }
-        if (!placed) {
-          // Fallback: let resetCueBallIfPocketed pick a spot
-          const fallback = this.ballsManager.resetCueBallIfPocketed(0, headStringZ - BALL.radius * 2);
-          cue?.reset(fallback.x, BALL.radius, fallback.z);
-        }
+        this._placeCueBallInHand(behindLine);
       }
       // Reset AI spin so human player starts with center hit
       this.cueTipOffset = { x: 0, y: 0 };
@@ -2074,6 +2121,7 @@ export class Game {
 
   resetGame() {
     if (this.state === 'DISPOSED') return;
+    this._abandonShot();
     this._rackId++;
     this.achievements.onGameStart();
     this._lastReplayData = null;
@@ -2082,31 +2130,26 @@ export class Game {
     }
     if (this.ballReturn) this.ballReturn.reset();
     for (const ball of this.ballsManager.balls) {
-      const listener = this._ballCollideListeners.get(ball.id);
-      if (listener) ball.body.removeEventListener('collide', listener);
       this.scene.remove(ball.mesh);
-      this.physics.removeBody(ball.body);
       ball.geometry.dispose();
       ball.material.dispose();
     }
-    this._ballCollideListeners.clear();
-    this.ballsManager = new BallsManager(this.physics, this.tableProfile);
+    this.ballsManager = new BallsManager(this.tableProfile);
     this.ballsManager.createBalls();
     if (this.mode === 'trainer' && this.drillConfig) {
       const { idealZone } = this.ballsManager.setupDrill(this.drillConfig, this.tableProfile);
       this.drillIdealZone = idealZone;
     } else {
-      const rackMode = this.mode === '9ball' ? '9ball' : '8ball';
-      this.ballsManager.rackBalls(rackMode);
+      // A new rack always starts player 1 (currentPlayer is reset below), whoever shot last.
+      this.ballsManager.applyLayout(this.match.newRack(0));
     }
-    this._wireBallsManagerEvents();
     this.ballsManager.addToScene(this.scene);
-    this.setupCollisionEvents();
     for (const ball of this.ballsManager.balls) {
       ball.updateVisualSettings(settings);
     }
 
-    if (this.rules) this.rules.reset();
+    this._pushOutDeclared = false;
+    this._placedCueBall = null;
     this.statsTracker.reset();
     this.particles.clear();
     this.trails.clear();
@@ -2750,14 +2793,14 @@ export class Game {
     if (this.mode === 'trainer') return '击球训练';
     if (this.mode === 'freeplay') return UIText.objectiveFreeplay;
     if (this.mode === '9ball') {
-      const status = this.rules?.getStatus();
+      const status = this.match?.status();
       if (status?.targetBall) {
         return UIText.objective9Ball(status.targetBall);
       }
       return UIText.objective9BallOpen;
     }
     // 8-ball: dynamic based on open/closed table
-    const status = this.rules?.getStatus();
+    const status = this.match?.status();
     if (status) {
       if (!status.player1Group && !status.player2Group) {
         return UIText.objective8BallOpen;
@@ -2775,7 +2818,7 @@ export class Game {
   }
 
   _updatePlayerStats() {
-    const status = this.rules ? this.rules.getStatus() : null;
+    const status = this.match?.status() ?? null;
     const p2Name = this.aiEnabled && this.networkPlayer2Name === '玩家 2' ? 'AI' : (this.networkPlayer2Name || '玩家 2');
     const p1Name = this.networkPlayer1Name || '玩家 1';
     const is9Ball = this.mode === '9ball';
@@ -2871,17 +2914,17 @@ export class Game {
         }
       };
       this._onNetPushOutDeclare = (e) => {
-        if (this.networkRole === 'host' && this.rules) {
+        if (this.networkRole === 'host' && this.match?.mode) {
           if (e.detail?.fromPlayer !== this.currentPlayer) return;
           if (this.paused || this.state !== 'AIM' || this.ballInHand) return;
           if (this._turnTimerEnabled && this._turnTimerRemaining <= 0) return;
-          if (!this.rules.pushOutAvailable) return;
-          this.rules.declarePushOut();
+          if (!this.match.status().pushOutAvailable) return;
+          this._pushOutDeclared = true;
           this._broadcastSnapshot();
         }
       };
       this._onNetPushOutChoice = (e) => {
-        if (this.networkRole === 'host' && this.rules) {
+        if (this.networkRole === 'host' && this.match?.mode) {
           if (e.detail?.fromPlayer !== this.currentPlayer) return;
           if (this.paused || this.state !== 'AIM' || this.ballInHand) return;
           if (this._turnTimerEnabled && this._turnTimerRemaining <= 0) return;
@@ -2972,11 +3015,8 @@ export class Game {
     this.ui.setHUDState('GAME_OVER');
     if (this.cue) this.cue.hide();
 
-    // Notify rules engine
-    if (this.rules) {
-      this.rules.gameOver = true;
-      this.rules.winner = winner;
-    }
+    // The conceding seat leaves the match; the other one wins.
+    if (this.match?.mode) this.match.concede(concedingPlayer - 1);
 
     // End stats tracking and show summary
     const summary = this.statsTracker.endGame(winner);
@@ -3348,27 +3388,22 @@ export class Game {
 
   _resetTrainerDrill() {
     if (this.mode !== 'trainer' || !this.drillConfig) return;
+    this._abandonShot();
 
     // Remove old balls
     for (const ball of this.ballsManager.balls) {
-      const listener = this._ballCollideListeners.get(ball.id);
-      if (listener) ball.body.removeEventListener('collide', listener);
       this.scene.remove(ball.mesh);
-      this.physics.removeBody(ball.body);
       ball.geometry.dispose();
       ball.material.dispose();
     }
-    this._ballCollideListeners.clear();
 
     // Recreate balls in drill layout
-    this.ballsManager = new BallsManager(this.physics, this.tableProfile);
+    this.ballsManager = new BallsManager(this.tableProfile);
     this.ballsManager.createBalls();
     if (this.instantReplay) this.instantReplay.setBallsManager(this.ballsManager);
     const { idealZone } = this.ballsManager.setupDrill(this.drillConfig, this.tableProfile);
     this.drillIdealZone = idealZone;
-    this._wireBallsManagerEvents();
     this.ballsManager.addToScene(this.scene);
-    this.setupCollisionEvents();
     for (const ball of this.ballsManager.balls) {
       ball.updateVisualSettings(settings);
     }
@@ -3405,6 +3440,7 @@ export class Game {
 
   dispose() {
     try {
+    this._abandonShot();
     if (this._strikeHideTimer) {
       clearTimeout(this._strikeHideTimer);
       this._strikeHideTimer = null;
@@ -3455,22 +3491,12 @@ export class Game {
       this._onKeyDown = null;
     }
 
-    // Remove all balls and their collide listeners
+    // Remove all balls
     if (this.ballsManager) {
       for (const ball of this.ballsManager.balls) {
-        const listener = this._ballCollideListeners.get(ball.id);
-        if (listener) {
-          ball.body.removeEventListener('collide', listener);
-        }
         this.scene.remove(ball.mesh);
-        this.physics.removeBody(ball.body);
         ball.geometry.dispose();
         ball.material.dispose();
-      }
-      this._ballCollideListeners.clear();
-      if (this.ballsManager) {
-        this.ballsManager.onManualBallContact = null;
-        this.ballsManager.onManualCushionContact = null;
       }
       this.ballsManager = null;
     }
@@ -3481,10 +3507,7 @@ export class Game {
       this.room = null;
     }
 
-    // Remove table (physics bodies first)
-    if (this.physics) {
-      this.physics.removeTableBody();
-    }
+    // Remove table
     if (this.table) {
       this.table.dispose();
       this.table = null;
@@ -3648,7 +3671,6 @@ export class Game {
     this.statsPanel = null;
     this.trajectory = null;
     this.renderer = null;
-    this.physics = null;
     this.scene = null;
     this.camera = null;
     this.matchManager = null;
@@ -3656,7 +3678,8 @@ export class Game {
     this.aiPlayer1 = null;
     this.aiPlayer2 = null;
     this.networkController = null;
-    this.rules = null;
+    this.match?.dispose();
+    this.match = null;
     this._settingsOpen = false;
     this._initialized = false;
     this._hostFairness = null;
